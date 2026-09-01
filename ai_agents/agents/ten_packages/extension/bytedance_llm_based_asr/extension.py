@@ -9,9 +9,10 @@ import itertools
 import json
 import os
 import websockets
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from ten_ai_base.message import ModuleMetrics
-from typing import Any, cast
+from typing import Any, AsyncIterator, cast
 from typing_extensions import override
 
 from ten_ai_base.asr import (
@@ -176,6 +177,7 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
 
         self._update_configs_lock: asyncio.Lock = asyncio.Lock()
         self._connection_io_lock: asyncio.Lock = asyncio.Lock()
+        self._connection_io_owner: asyncio.Task[Any] | None = None
 
     @override
     def vendor(self) -> str:
@@ -351,6 +353,16 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
     @override
     async def stop_connection(self) -> None:
         """Stop connection to Volcengine ASR service."""
+        current_task = asyncio.current_task()
+        if self._connection_io_owner is current_task:
+            await self._stop_connection_locked()
+            return
+
+        async with self._connection_io_guard():
+            await self._stop_connection_locked()
+
+    async def _stop_connection_locked(self) -> None:
+        """Stop the connection while the caller owns the connection lock."""
         if self.client:
             try:
                 await self.client.disconnect()
@@ -364,15 +376,37 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
         if self.log_id_dumper_manager:
             await self.log_id_dumper_manager.stop()
 
+    @asynccontextmanager
+    async def _connection_io_guard(self) -> AsyncIterator[None]:
+        """Serialize connection I/O and avoid same-task lock re-entry."""
+        current_task = asyncio.current_task()
+        if self._connection_io_owner is current_task:
+            yield
+            return
+
+        await self._connection_io_lock.acquire()
+        self._connection_io_owner = current_task
+        try:
+            yield
+        finally:
+            self._connection_io_owner = None
+            self._connection_io_lock.release()
+
     async def _restart_connection_locked(self) -> None:
         """Restart the connection while the caller holds the connection lock."""
-        assert self._connection_io_lock.locked()
+        assert self._connection_io_owner is asyncio.current_task()
         await self.stop_connection()
         await self.start_connection()
 
     async def _restart_connection(self) -> None:
         """Restart without interrupting connection I/O already in progress."""
-        async with self._connection_io_lock:
+        if self._connection_io_owner is asyncio.current_task():
+            self.ten_env.log_warn(
+                "Skipping reentrant ASR connection restart in the lock owner task"
+            )
+            return
+
+        async with self._connection_io_guard():
             await self._restart_connection_locked()
 
     @override
@@ -382,7 +416,8 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
 
         # Stop connection first to ensure proper cleanup order
         # This ensures client resources are cleaned up before other resources
-        await self.stop_connection()
+        async with self._connection_io_guard():
+            await self.stop_connection()
 
         if self.audio_dumper:
             try:
@@ -435,19 +470,7 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
             # Get audio data from frame
             audio_data = bytes(buf)
 
-            # Dump audio if enabled (original audio_dumper, unchanged)
-            if self.audio_dumper:
-                await self.audio_dumper.push_bytes(audio_data)
-
-            # Dump audio to log_id_dumper if enabled (manager handles rename if needed)
-            if self.log_id_dumper_manager:
-                await self.log_id_dumper_manager.push_bytes(audio_data)
-
-            self.audio_timeline.add_user_audio(
-                int(len(buf) / (self.input_audio_sample_rate() / 1000 * 2))
-            )
-
-            async with self._connection_io_lock:
+            async with self._connection_io_guard():
                 if not self.is_connected():
                     self.ten_env.log_warn(
                         "Not connected to ASR service, attempting to reconnect..."
@@ -461,6 +484,16 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
 
                 assert self.client is not None
                 await self.client.send_audio(audio_data)
+
+            # Only record audio after the client accepts it for sending.
+            self.audio_timeline.add_user_audio(
+                int(len(buf) / (self.input_audio_sample_rate() / 1000 * 2))
+            )
+
+            if self.audio_dumper:
+                await self.audio_dumper.push_bytes(audio_data)
+            if self.log_id_dumper_manager:
+                await self.log_id_dumper_manager.push_bytes(audio_data)
             return True
 
         except Exception as e:
@@ -476,7 +509,7 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
     async def finalize(self, session_id: str | None) -> None:
         """Finalize current ASR session."""
         try:
-            async with self._connection_io_lock:
+            async with self._connection_io_guard():
                 if not self.is_connected():
                     return
 
@@ -1216,7 +1249,7 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
             category=LOG_CATEGORY_KEY_POINT,
         )
 
-        async with self._connection_io_lock:
+        async with self._connection_io_guard():
             self.config = new_config
             await self._restart_connection_locked()
 

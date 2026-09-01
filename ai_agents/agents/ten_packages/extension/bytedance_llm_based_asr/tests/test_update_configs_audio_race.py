@@ -259,6 +259,29 @@ async def test_send_audio_error_can_reconnect_without_deadlock():
 
 
 @pytest.mark.asyncio
+async def test_failed_audio_send_does_not_update_timeline_or_dumpers():
+    client = MagicMock()
+    client.connected = True
+    client.send_audio = AsyncMock(side_effect=RuntimeError("send failed"))
+    extension = _new_extension(client)
+    extension._handle_error = AsyncMock()
+
+    audio_dumper = MagicMock()
+    audio_dumper.push_bytes = AsyncMock()
+    extension.audio_dumper = audio_dumper
+    log_id_dumper_manager = MagicMock()
+    log_id_dumper_manager.push_bytes = AsyncMock()
+    extension.log_id_dumper_manager = log_id_dumper_manager
+
+    result = await extension.send_audio(_frame(), "session-1")
+
+    assert result is False
+    assert extension.audio_timeline.get_total_user_audio_duration() == 0
+    audio_dumper.push_bytes.assert_not_awaited()
+    log_id_dumper_manager.push_bytes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_finalize_error_can_reconnect_without_deadlock():
     failed_client = MagicMock()
     failed_client.connected = True
@@ -284,6 +307,43 @@ async def test_finalize_error_can_reconnect_without_deadlock():
     stop_mock.assert_awaited_once()
     start_mock.assert_awaited_once()
     assert extension.client is replacement_client
+
+
+@pytest.mark.asyncio
+async def test_on_deinit_waits_for_in_flight_audio():
+    client = _RaceClient()
+    extension = _new_extension(client)
+    stop_mock = AsyncMock()
+    extension.stop_connection = stop_mock
+
+    audio_task = asyncio.create_task(
+        extension.send_audio(_frame(), "session-1")
+    )
+    await client.audio_send_started.wait()
+    deinit_task = asyncio.create_task(extension.on_deinit(extension.ten_env))
+    await asyncio.sleep(0)
+
+    stop_mock.assert_not_awaited()
+    client.allow_audio_send.set()
+    await asyncio.wait_for(asyncio.gather(audio_task, deinit_task), timeout=1)
+
+    stop_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reentrant_restart_does_not_wait_on_connection_lock():
+    extension = _new_extension(MagicMock())
+    extension.stop_connection = AsyncMock()
+
+    async def reentrant_start() -> None:
+        await extension._restart_connection()
+
+    extension.start_connection = AsyncMock(side_effect=reentrant_start)
+
+    await asyncio.wait_for(extension._restart_connection(), timeout=1)
+
+    extension.stop_connection.assert_awaited_once()
+    extension.start_connection.assert_awaited_once()
 
 
 @pytest.mark.asyncio
