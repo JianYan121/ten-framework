@@ -364,6 +364,17 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
         if self.log_id_dumper_manager:
             await self.log_id_dumper_manager.stop()
 
+    async def _restart_connection_locked(self) -> None:
+        """Restart the connection while the caller holds the connection lock."""
+        assert self._connection_io_lock.locked()
+        await self.stop_connection()
+        await self.start_connection()
+
+    async def _restart_connection(self) -> None:
+        """Restart without interrupting connection I/O already in progress."""
+        async with self._connection_io_lock:
+            await self._restart_connection_locked()
+
     @override
     async def on_deinit(self, ten_env: AsyncTenEnv) -> None:
         """Clean up resources when extension is deinitialized."""
@@ -464,26 +475,28 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
     @override
     async def finalize(self, session_id: str | None) -> None:
         """Finalize current ASR session."""
-        if not self.is_connected():
-            return
-
         try:
-            self.last_finalize_timestamp = int(
-                asyncio.get_event_loop().time() * 1000
-            )
-            self.ten_env.log_debug(
-                f"Finalize start at {self.last_finalize_timestamp}"
-            )
+            async with self._connection_io_lock:
+                if not self.is_connected():
+                    return
 
-            await self.client.finalize()
-
-            # Record silence audio in timeline (client sends silence data)
-            if self.config:
-                self.audio_timeline.add_silence_audio(
-                    self.config.get_mute_pkg_duration_ms()
+                self.last_finalize_timestamp = int(
+                    asyncio.get_event_loop().time() * 1000
                 )
+                self.ten_env.log_debug(
+                    f"Finalize start at {self.last_finalize_timestamp}"
+                )
+
+                await self.client.finalize()
+
+                # Record silence audio in timeline (client sends silence data)
+                if self.config:
+                    self.audio_timeline.add_silence_audio(
+                        self.config.get_mute_pkg_duration_ms()
+                    )
         except Exception as e:
             self.ten_env.log_error(f"Error finalizing session: {e}")
+            # Error handling may reconnect and must run after releasing the lock.
             await self._handle_error(e)
 
     @override
@@ -544,8 +557,7 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
                 await asyncio.sleep(delay)
 
             try:
-                await self.stop_connection()
-                await self.start_connection()
+                await self._restart_connection()
             except Exception as e:
                 self.ten_env.log_error(f"Reconnection failed: {e}")
                 if not self.stopped:
@@ -1176,7 +1188,8 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
         has_params = isinstance(params_patch, dict) and bool(params_patch)
         has_url = isinstance(url_val, str) and bool(url_val.strip())
 
-        params = self.config.params
+        new_config = self.config.model_copy(deep=True)
+        params = new_config.params
         if not isinstance(params, dict):
             return False, "params_not_dict"
 
@@ -1184,7 +1197,7 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
             params["api_url"] = cast(str, url_val).strip()
 
         if dump_present:
-            self.config.dump = bool(payload["dump"])
+            new_config.dump = bool(payload["dump"])
 
         keys_for_log: list[str] = []
         if has_params:
@@ -1193,6 +1206,10 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
             _deep_merge_dict(params, patch)
             _strip_empty_request_corpus_context(params)
 
+        new_config = BytedanceASRLLMConfig.model_validate(
+            new_config.model_dump()
+        )
+
         self.ten_env.log_info(
             "update_configs: merged payload keys into config, reconnecting "
             f"(params_keys={keys_for_log})",
@@ -1200,8 +1217,8 @@ class BytedanceASRLLMExtension(AsyncASRBaseExtension):
         )
 
         async with self._connection_io_lock:
-            await self.stop_connection()
-            await self.start_connection()
+            self.config = new_config
+            await self._restart_connection_locked()
 
         return True, ""
 
